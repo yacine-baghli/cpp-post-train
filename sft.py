@@ -78,6 +78,11 @@ def build_sequences(traj: dict, tok, max_len: int = 24000, b_frac: float = 0.4) 
         if msgs[i].get("_skip"):  # e.g. an attempt that failed the samples: context only
             return [0.0] * len(tgt)
         w = [1.0] * len(tgt)
+        if traj.get("actions_only"):  # never train on thinking: it stays exactly the base model's
+            if think_end in tgt:
+                k = tgt.index(think_end)
+                w[: k + 1] = [0.0] * (k + 1)
+            return w
         long_r = len(msgs[i].get("reasoning_content") or "") > 2600
         first_ok = traj.get("mask_all") or i != a_idx[0]
         by_rule = traj.get("mask_long") and first_ok and long_r
@@ -99,6 +104,8 @@ def build_sequences(traj: dict, tok, max_len: int = 24000, b_frac: float = 0.4) 
             ok = False
             break
         prefix, tgt = r
+        if traj.get("truncate") and len(prefix) + len(tgt) > max_len:
+            break  # RL data: keep the turns that fit rather than dropping the whole run
         if prefix[: len(toks)] != toks:
             if len(toks) <= max_len and any(w):
                 seqs.append((toks, w))
@@ -107,6 +114,10 @@ def build_sequences(traj: dict, tok, max_len: int = 24000, b_frac: float = 0.4) 
         toks = prefix + tgt
     if ok and len(toks) <= max_len and any(w):
         seqs.append((toks, w))
+    scale = traj.get("w")
+    if scale is not None:  # advantage of this run: positive pushes its tokens up, negative pushes them down
+        seqs = [(t_, [x * scale for x in w_]) for t_, w_ in seqs]
+        return seqs
 
     # B) reasoning stripped from history; first turn is identical to A, so skip it
     if random.Random(traj["id"]).random() >= b_frac:
@@ -151,10 +162,11 @@ def scrub(text: str) -> str:
     return "\n".join(line for line in text.split("\n") if not _LEAK.search(line))
 
 
-def select(trajs: list, max_turns: int = 6, shapes: bool = False, max_t1_chars: int = 0) -> list:
-    """Clean, solved, EXIT-terminated; one per problem, fewest turns then fewest tokens."""
+def select(trajs: list, max_turns: int = 6, shapes: bool = False, max_t1_chars: int = 0,
+           dedupe: bool = True) -> list:
+    """Clean, solved, EXIT-terminated; one per problem (unless dedupe is off), fewest turns then fewest tokens."""
     best = {}
-    for t in trajs:
+    for n, t in enumerate(trajs):
         if not (t.get("solved") and t.get("clean") and t.get("exited") and t["turns"] <= max_turns):
             continue
         if shapes and not GOOD_SHAPES.match(shape(t)):
@@ -163,13 +175,15 @@ def select(trajs: list, max_turns: int = 6, shapes: bool = False, max_t1_chars: 
         if max_t1_chars and len(first.get("reasoning_content") or "") > max_t1_chars:
             continue
         key = (t["turns"], t["completion_tokens"])
-        if t["id"] not in best or key < best[t["id"]][0]:
-            best[t["id"]] = (key, t)
+        slot = t["id"] if dedupe else (t["id"], n)
+        if slot not in best or key < best[slot][0]:
+            best[slot] = (key, t)
     out = []
     for _, t in best.values():
-        t["messages"][-1]["content"] = "EXIT"  # drop any closing explanation: the grader looks for EXIT
+        if t.get("w") is None:  # RL rows keep failed runs exactly as they happened
+            t["messages"][-1]["content"] = "EXIT"  # drop any closing explanation: the grader looks for EXIT
         for m in t["messages"]:
-            if m["role"] == "assistant":
+            if m["role"] == "assistant" and not t.get("native"):  # native runs had no hidden prompt to scrub
                 m["content"] = scrub(m.get("content") or "")
                 if m.get("reasoning_content"):
                     m["reasoning_content"] = scrub(m["reasoning_content"])
@@ -178,7 +192,8 @@ def select(trajs: list, max_turns: int = 6, shapes: bool = False, max_t1_chars: 
 
 
 def train(trajs: list, name: str, *, lr: float = 1e-4, epochs: float = 2, batch_size: int = 8,
-          rank: int = 32, seed: int = 0, save_every: int = 0, b_frac: float = 0.4, log=print) -> list:
+          rank: int = 32, seed: int = 0, save_every: int = 0, b_frac: float = 0.4, max_len: int = 24000,
+          actions_only: bool = False, export: bool = False, log=print) -> list:
     import tinker
     from tinker import types
 
@@ -188,7 +203,9 @@ def train(trajs: list, name: str, *, lr: float = 1e-4, epochs: float = 2, batch_
 
     seqs = []
     for t in trajs:
-        seqs += build_sequences(t, tok, b_frac=b_frac)
+        if actions_only and not t.get("keep_think"):
+            t["actions_only"] = True
+        seqs += build_sequences(t, tok, max_len=max_len, b_frac=b_frac)
     n_tok = sum(len(s[0]) for s in seqs)
     n_w = sum(sum(s[1]) for s in seqs)
     log(f"loss on {n_w:,.0f} of {n_tok:,} tokens")
@@ -227,7 +244,12 @@ def train(trajs: list, name: str, *, lr: float = 1e-4, epochs: float = 2, batch_
             p = tc.save_weights_for_sampler(name=f"{name}-s{step + 1}").result().path
             paths.append(p)
             log(f"CHECKPOINT {p}")
+            if export:
+                log(f"EXTERNAL {tc.save_weights_external(name=f'{name}-s{step + 1}-ext').result().path}")
     p = tc.save_weights_for_sampler(name=f"{name}-final").result().path
     paths.append(p)
     log(f"CHECKPOINT {p}")
+    if export:  # adapter files that can be downloaded, edited and uploaded back
+        log(f"STATE {tc.save_state(name=f'{name}-final-state').result().path}")
+        log(f"EXTERNAL {tc.save_weights_external(name=f'{name}-final-ext').result().path}")
     return paths

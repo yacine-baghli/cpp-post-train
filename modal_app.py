@@ -117,8 +117,9 @@ def prep_large(split: str = "dev", k: int = 6, max_bytes: int = 6_000_000):
     vol.commit()
 
 
-@app.function(image=image, secrets=[secret], volumes={"/data": vol}, timeout=3000, cpu=2, memory=4096,
+@app.function(image=image, secrets=[secret], volumes={"/data": vol}, timeout=3000, cpu=8, memory=16384,
               max_containers=100, retries=1)
+@modal.concurrent(max_inputs=12)
 def episode(problem: dict, cfg: dict) -> dict:
     from harness import run_episode
 
@@ -160,7 +161,7 @@ def _summary(rows: list) -> str:
     )
 
 
-@app.function(image=image, volumes={"/data": vol}, timeout=6 * 3600)
+@app.function(image=image, volumes={"/data": vol}, timeout=6 * 3600, memory=16384)
 def gen(model: str, tag: str, split: str = "train", n: int = 40, offset: int = 0, rmin: int = 800,
         rmax: int = 3500, max_tokens: int = 16000, temperature: float = 0.6, reasoning: str = "true",
         samples: int = 1, max_turns: int = 12, pass_reasoning: bool = True, strategy: bool = False,
@@ -200,22 +201,30 @@ def gen(model: str, tag: str, split: str = "train", n: int = 40, offset: int = 0
             for s in range(samples) for p in probs
         ]
     path = f"/data/traj/{tag}.jsonl"
-    rows = _load(path)
-    print(f"{tag}: {len(inputs)} episodes with {model}; {len(rows)} already on disk")
-    done = 0
+    os.makedirs("/data/traj", exist_ok=True)
+    light = [{k: v for k, v in r.items() if k != "messages"} for r in _load(path)]
+    print(f"{tag}: {len(inputs)} episodes with {model}; {len(light)} already on disk")
+    done, buf = 0, []
+
+    def flush():
+        with open(path, "a") as f:
+            for r in buf:
+                f.write(json.dumps(r) + chr(10))
+        buf.clear()
+        vol.commit()
+
     for res in episode.starmap(inputs, order_outputs=False, return_exceptions=True):
         done += 1
         if isinstance(res, Exception):
             print("episode failed:", repr(res)[:300])
             continue
-        rows.append(res)
+        buf.append(res)
+        light.append({k: v for k, v in res.items() if k != "messages"})
         if done % 10 == 0 or done == len(inputs):
-            _dump(path, rows)
-            vol.commit()
-            print(f"[{done}/{len(inputs)}] {_summary(rows)}")
-    _dump(path, rows)
-    vol.commit()
-    print("DONE", tag, _summary(rows))
+            flush()
+            print(f"[{done}/{len(inputs)}] {_summary(light)}")
+    flush()
+    print("DONE", tag, _summary(light))
 
 
 @app.function(image=image, volumes={"/data": vol})
@@ -428,6 +437,456 @@ def compose(base_tag: str = "rw1", brute_tag: str = "bt1", out: str = "cmp1", ke
         print("EXAMPLE T1 reasoning:", a[0]["reasoning_content"][:1200])
 
 
+@app.function(image=image, volumes={"/data": vol}, timeout=1800, memory=16384, max_containers=24, retries=2)
+def fetch_large_one(cid: str, ids: list, k: int = 4, max_bytes: int = 3_000_000) -> int:
+    """Largest generated tests for the problems of one contest (see prep_large)."""
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
+
+    todo = [pid for pid in ids if not os.path.exists(_large_path(pid))]
+    if not todo:
+        return 0
+    try:
+        path = hf_hub_download("open-r1/codeforces", f"generated_tests/test_cases_{cid}.parquet", repo_type="dataset")
+        table = pq.read_table(path, filters=[("problem_id", "in", todo)]).to_pylist()
+    except Exception as e:
+        if "404" in repr(e) or "EntryNotFound" in repr(e):
+            return 0
+        raise
+    os.makedirs("/data/large", exist_ok=True)
+    n = 0
+    for pid in todo:
+        rows = sorted((r for r in table if r["problem_id"] == pid and r["output"].strip()), key=lambda r: -len(r["input"]))
+        pick = [{"input": r["input"], "output": r["output"]} for r in rows if len(r["input"]) + len(r["output"]) <= max_bytes][:k]
+        if pick:
+            with open(_large_path(pid), "w") as f:
+                json.dump(pick, f)
+            n += 1
+    vol.commit()
+    return n
+
+
+@app.function(image=image, volumes={"/data": vol}, timeout=3600, memory=16384)
+def prep_large_train(n: int = 700, offset: int = 0, rmin: int = 1000, rmax: int = 2800):
+    by_contest = defaultdict(list)
+    for p in [p for p in _load("/data/problems/train.jsonl") if rmin <= p["rating"] <= rmax][offset: offset + n]:
+        by_contest[p["id"].split("/")[0]].append(p["id"])
+    got = sum(r for r in fetch_large_one.starmap(list(by_contest.items()), return_exceptions=True) if isinstance(r, int))
+    print(f"LARGE: tests fetched for {got} problems across {len(by_contest)} contests")
+
+
+@app.function(image=image, volumes={"/data": vol}, timeout=1500, cpu=8, memory=8192, max_containers=100, retries=1)
+@modal.concurrent(max_inputs=4)
+def regrade_one(problem: dict, codes: list) -> list:
+    """For each submitted program: does it pass every official test, and every large test?
+    Stops at the first failure, which is all the 40/60 score needs."""
+    from harness import Sandbox, same_output
+
+    large = []
+    try:  # no volume reload here: several gradings share a container and a reload breaks open files
+        with open(_large_path(problem["id"])) as f:
+            large = json.load(f)
+    except (FileNotFoundError, OSError, ValueError):
+        large = []
+    tl = float(problem.get("time_limit") or 2.0)
+    sb, out, seen = Sandbox(problem), [], {}
+    try:
+        for code in codes:
+            if code in seen:
+                out.append(seen[code])
+                continue
+            exe, _ = sb.compile(code)
+            res = {"small": False, "large": None}
+            if exe:
+                def all_pass(tests):
+                    for t in tests:
+                        r = sb.run(exe, t["input"], timeout=tl * 2 + 1)
+                        if r["tle"] or r["exit_code"] != 0 or not same_output(r["stdout"], t["output"]):
+                            return False
+                    return True
+                res["small"] = all_pass(problem["tests"])
+                if large:
+                    res["large"] = all_pass(large)
+            seen[code] = res
+            out.append(res)
+    finally:
+        sb.close()
+    return out
+
+
+def _reward(g: dict) -> int:
+    """40 for the small tests, 60 for the large ones (30 when the problem has no large tests to check)."""
+    return 40 * g["small"] + (30 if g["large"] is None else 60 * g["large"]) * g["small"]
+
+
+@app.function(image=image, volumes={"/data": vol}, timeout=3 * 3600, memory=32768)
+def build_ei(tags: str, out: str, per_problem: int = 2, max_turns: int = 10):
+    """Expert iteration data from the model's own runs: grade every submission, keep the best run(s)
+    per problem, cut each at its earliest best submission and end with EXIT."""
+    from harness import VARIANTS
+
+    # only metadata is needed here: the run already tells us whether the final code passes the official tests
+    problems = {p["id"]: {**{k: v for k, v in p.items() if k != "tests"}, "tests": []}
+                for p in _load("/data/problems/train.jsonl")}
+    trajs = []
+    for tag in tags.split(","):
+        trajs += _load(f"/data/traj/{tag}.jsonl")
+    items = []
+    for ti, t in enumerate(trajs):
+        if not (t.get("solved") and t.get("final_code") and t["id"] in problems):
+            continue
+        key = VARIANTS[t["variant"]]["code"]
+        for i, m in enumerate(t["messages"]):
+            calls = m.get("tool_calls") or []
+            if len(calls) == 1 and "submit" in calls[0]["function"]["name"]:
+                try:
+                    code = json.loads(calls[0]["function"]["arguments"]).get(key)
+                except Exception:
+                    continue
+                if code == t["final_code"]:  # earliest submission of the winning program
+                    items.append((ti, i))
+                    break
+    print(f"EI: {len(trajs)} runs, {len(items)} solved on the official tests; checking large tests...")
+    grades = list(regrade_one.starmap(
+        [(problems[trajs[ti]["id"]], [trajs[ti]["final_code"]]) for ti, _ in items], return_exceptions=True))
+
+    cands = defaultdict(list)
+    for (ti, cut), gs in zip(items, grades):
+        if isinstance(gs, Exception):
+            continue
+        t, msgs = trajs[ti], trajs[ti]["messages"]
+        best = _reward(gs[0])
+        if best <= 0:
+            continue
+        first_user = next(i for i, m in enumerate(msgs) if m["role"] == "user")
+        prefix = msgs[first_user + 1: cut + 2]  # ... winning submission + its tool result
+        a = [m for m in prefix if m["role"] == "assistant"]
+        clean = (all(m["role"] != "user" for m in prefix) and all(len(m.get("tool_calls") or []) == 1 for m in a)
+                 and not any(m["role"] == "tool" and m["content"].startswith("Malformed") for m in prefix)
+                 and len(a) <= max_turns and "FAILED" not in prefix[-1]["content"]
+                 and not prefix[-1]["content"].startswith("Compilation failed"))
+        if not clean:
+            continue
+        new = {k: v for k, v in t.items() if k != "messages"}
+        new.update(messages=msgs[: cut + 2] + [{"role": "assistant", "content": "EXIT"}], reward=best,
+                   native=True, solved=True, clean=True, exited=True, turns=len(a) + 1)
+        cands[t["id"]].append((-best, len(a), sum(len(m.get("reasoning_content") or "") for m in a), new))
+
+    rows, hist = [], defaultdict(int)
+    for pid, cs in cands.items():
+        cs.sort(key=lambda c: c[:3])
+        keep = cs[:per_problem] if -cs[0][0] >= 70 else cs[:1]
+        keep = [c for c in keep if c[0] == cs[0][0]]  # only runs that match the best reward
+        for c in keep:
+            rows.append(c[3])
+            hist[c[3]["reward"]] += 1
+    _dump(f"/data/traj/{out}.jsonl", rows)
+    vol.commit()
+    by = defaultdict(int)
+    for r in rows:
+        by[(r.get("rating") or 0) // 400 * 400] += 1
+    n_prob = len({t["id"] for t in trajs})
+    print(f"EI {out}: {len(cands)} of {n_prob} problems have a usable run -> {len(rows)} trajectories; "
+          f"by reward {dict(sorted(hist.items()))}; by rating {dict(sorted(by.items()))}; "
+          f"avg turns {sum(r['turns'] for r in rows) / max(len(rows), 1):.1f}")
+
+
+@app.function(image=image, secrets=[secret], timeout=3600, memory=32768)
+def scale_adapter(ext_path: str, alphas: str = "0.5", name: str = "scaled", rank: int = 32):
+    """Weight-space edit: multiply the LoRA update by alpha (0 = base model, 1 = the trained adapter).
+    Downloads the exported adapter, scales the B matrices (the update is B @ A), uploads the result and
+    turns it into a sampler checkpoint that can be submitted."""
+    import httpx
+    import numpy as np
+    import tinker
+    from safetensors.numpy import load as st_load
+    from safetensors.numpy import save as st_save
+    from tinker import types
+
+    from common import BASE_MODEL
+
+    service = tinker.ServiceClient(display_name="weight-space")
+    rest = service.create_rest_client()
+    urls = rest.get_external_weights_urls(ext_path).result().urls
+    files = {rel: httpx.get(u, timeout=900, follow_redirects=True).content for rel, u in urls.items()}
+    print("FILES", {k: len(v) for k, v in files.items()})
+    st_files = [k for k in files if k.endswith(".safetensors")]
+    tensors = {k: st_load(files[k]) for k in st_files}
+    for k in st_files:
+        keys = list(tensors[k])
+        print("KEYS", k, len(keys), keys[:6], [tensors[k][x].shape for x in keys[:6]], tensors[k][keys[0]].dtype)
+    for alpha in [float(a) for a in alphas.split(",")]:
+        new_files, n_scaled = dict(files), 0
+        for k in st_files:
+            out = {}
+            for key, v in tensors[k].items():
+                if "lora_b" in key.lower():  # scale one factor only, so B @ A is scaled exactly once
+                    out[key] = (v.astype(np.float32) * alpha).astype(v.dtype)
+                    n_scaled += 1
+                else:
+                    out[key] = v
+            new_files[k] = st_save(out)
+        if not n_scaled:
+            print("no lora_B tensors found; nothing scaled")
+            return
+        start = rest.external_weights_upload_start(base_model=BASE_MODEL, lora_config=types.LoraConfig(rank=rank)).result()
+        missing = set(start.urls) ^ set(new_files)
+        if missing:
+            print("file set mismatch", missing)
+        for rel, url in start.urls.items():
+            r = httpx.put(url, content=new_files[rel], timeout=900)
+            r.raise_for_status()
+        fin = rest.external_weights_upload_finish(start.upload_id).result()
+        tc = service.create_lora_training_client(base_model=BASE_MODEL, rank=rank).result()
+        tc.load_state(fin.tinker_path).result()
+        path = tc.save_weights_for_sampler(name=f"{name}-a{int(round(alpha * 100)):03d}").result().path
+        print(f"SCALED alpha={alpha} ({n_scaled} tensors) {path}")
+
+
+@app.function(image=image, secrets=[secret], timeout=3600, memory=32768)
+def decay_scale(state_path: str = "", alphas: str = "0.5", name: str = "scaled", lr: float = 0.01, wd: float = 1.0,
+                rank: int = 32, probe: bool = False):
+    """Weight-space scaling without uploading weights (uploads are disabled for our organisation).
+    Optimiser steps on a zero-weight loss have zero gradient, so the only thing that moves the adapter is
+    weight decay: every step multiplies each LoRA factor by (1 - lr * wd). After n steps the update B @ A is
+    scaled by (1 - lr * wd) ** (2 n). The effect is measured afterwards from the exported adapter norms."""
+    import math
+
+    import httpx
+    import numpy as np
+    import tinker
+    from safetensors.numpy import load as st_load
+    from tinker import types
+
+    from common import BASE_MODEL
+
+    service = tinker.ServiceClient(display_name="weight-space")
+    rest = service.create_rest_client()
+
+    def norms(tc, tag: str) -> tuple:
+        ext = tc.save_weights_external(name=tag).result().path
+        urls = rest.get_external_weights_urls(ext).result().urls
+        key = next(k for k in urls if k.endswith(".safetensors"))
+        t = st_load(httpx.get(urls[key], timeout=900, follow_redirects=True).content)
+        a = math.sqrt(sum(float((v.astype(np.float64) ** 2).sum()) for k, v in t.items() if "lora_A" in k))
+        b = math.sqrt(sum(float((v.astype(np.float64) ** 2).sum()) for k, v in t.items() if "lora_B" in k))
+        return a, b
+
+    def decay(tc, n: int) -> None:
+        ids = tc.get_tokenizer().encode("int main() { return 0; }")
+        datum = types.Datum(
+            model_input=types.ModelInput.from_ints(ids[:-1]),
+            loss_fn_inputs={
+                "target_tokens": types.TensorData.from_numpy(np.array(ids[1:], dtype=np.int64)),
+                "weights": types.TensorData.from_numpy(np.zeros(len(ids) - 1, dtype=np.float32)),
+            },
+        )
+        for _ in range(n):
+            fb = tc.forward_backward([datum], "cross_entropy")
+            op = tc.optim_step(types.AdamParams(learning_rate=lr, weight_decay=wd))
+            fb.result()
+            op.result()
+
+    if probe:  # does weight decay behave as assumed? check on a fresh adapter (A random, B zero)
+        tc = service.create_lora_training_client(base_model=BASE_MODEL, rank=rank).result()
+        a0, b0 = norms(tc, "probe-before")
+        decay(tc, 10)
+        a1, b1 = norms(tc, "probe-after")
+        print(f"PROBE |A| {a0:.4f} -> {a1:.4f} ratio {a1 / a0:.4f} (expected {(1 - lr * wd) ** 10:.4f}); |B| {b0:.4f} -> {b1:.4f}")
+        return
+
+    for alpha in [float(x) for x in alphas.split(",")]:
+        tc = service.create_training_client_from_state(state_path).result()
+        n = max(1, round(math.log(alpha) / (2 * math.log(1 - lr * wd))))
+        a0, b0 = norms(tc, f"{name}-before")
+        decay(tc, n)
+        path = tc.save_weights_for_sampler(name=f"{name}-a{int(round(alpha * 100)):03d}").result().path
+        a1, b1 = norms(tc, f"{name}-a{int(round(alpha * 100)):03d}-ext")
+        print(f"SCALED target alpha={alpha} steps={n} |A| x{a1 / a0:.4f} |B| x{b1 / b0:.4f} "
+              f"=> update scaled by about {a1 / a0 * b1 / b0:.3f} | {path}")
+
+
+NUDGES = [
+    "Call a tool ({run} or {submit}), or reply EXIT if you are finished.",
+    "Your last message did not contain a tool call. Call {run} or {submit}, or reply EXIT.",
+    "No tool call was found in your response. Please use one of the tools, or answer EXIT to finish.",
+    "Invalid response: expected a tool call or EXIT.",
+    "Your response was cut off before any tool call. Use a tool now, or reply EXIT.",
+    "Error: malformed tool call. Respond with a valid tool call or EXIT.",
+]
+
+
+@app.function(image=image, volumes={"/data": vol}, timeout=3 * 3600, memory=32768)
+def build_rl(tags: str = "r1,r1b,r1c", out: str = "rl1", max_groups: int = 300, per_group: int = 6,
+             rmin: int = 1300, neg_scale: float = 0.3):
+    """Policy-gradient data from the model's own runs. Each run is scored like the grader (0 / 40 / 100);
+    its advantage is that score minus the mean over the runs of the same problem, divided by their spread.
+    Better-than-average runs get a positive weight, worse ones a (smaller) negative weight."""
+    import random
+    import statistics
+
+    from harness import VARIANTS
+
+    problems = {p["id"]: {**{k: v for k, v in p.items() if k != "tests"}, "tests": []}
+                for p in _load("/data/problems/train.jsonl")}
+    trajs = []
+    for tag in tags.split(","):
+        trajs += _load(f"/data/traj/{tag}.jsonl")
+    solved = [ti for ti, t in enumerate(trajs) if t.get("solved") and t.get("final_code") and t["id"] in problems]
+    print(f"RL: {len(trajs)} runs, {len(solved)} solved on the official tests; checking large tests...")
+    grades = regrade_one.starmap([(problems[trajs[ti]["id"]], [trajs[ti]["final_code"]]) for ti in solved],
+                                 return_exceptions=True)
+    reward = defaultdict(int)
+    for ti, g in zip(solved, grades):
+        if not isinstance(g, Exception):
+            reward[ti] = _reward(g[0])
+    groups = defaultdict(list)
+    for ti, t in enumerate(trajs):
+        if t["id"] in problems and not t.get("error"):
+            groups[t["id"]].append(ti)
+    mixed = [(pid, tis) for pid, tis in groups.items()
+             if len(tis) >= 3 and len({reward[ti] for ti in tis}) > 1 and (problems[pid].get("rating") or 0) >= rmin]
+    rng = random.Random(0)
+    rng.shuffle(mixed)
+    mixed.sort(key=lambda g: -(problems[g[0]].get("rating") or 0))  # hardest problems first
+    rows, n_pos, n_neg = [], 0, 0
+    for pid, tis in mixed[:max_groups]:
+        rs = [reward[ti] for ti in tis]
+        mean, std = statistics.mean(rs), statistics.pstdev(rs)
+        rng.shuffle(tis)
+        for ti in tis[:per_group]:
+            adv = (reward[ti] - mean) / (std + 1e-6)
+            w = min(adv, 2.0) if adv > 0 else max(adv, -2.0) * neg_scale
+            if abs(w) < 0.05:
+                continue
+            t, msgs = trajs[ti], trajs[ti]["messages"]
+            if reward[ti] > 0:  # stop at the first submission of the winning program, then EXIT
+                key, cut = VARIANTS[t["variant"]]["code"], None
+                for i, m in enumerate(msgs):
+                    calls = m.get("tool_calls") or []
+                    if len(calls) == 1 and "submit" in calls[0]["function"]["name"]:
+                        try:
+                            if json.loads(calls[0]["function"]["arguments"]).get(key) == t["final_code"]:
+                                cut = i
+                                break
+                        except Exception:
+                            pass
+                if cut is None:
+                    continue
+                msgs = msgs[: cut + 2] + [{"role": "assistant", "content": "EXIT"}]
+            if any(m["role"] == "assistant" and len(m.get("tool_calls") or []) > 1 for m in msgs):
+                continue
+            new = {k: v for k, v in t.items() if k != "messages"}
+            new.update(messages=msgs, w=w, reward=reward[ti], native=True, truncate=True, solved=True, clean=True,
+                       exited=True, turns=1)
+            rows.append(new)
+            n_pos += w > 0
+            n_neg += w < 0
+    _dump(f"/data/traj/{out}.jsonl", rows)
+    vol.commit()
+    print(f"RL {out}: {len(mixed)} problems with mixed outcomes, used {min(len(mixed), max_groups)} -> "
+          f"{len(rows)} runs ({n_pos} with positive weight, {n_neg} negative)")
+
+
+@app.function(image=image, volumes={"/data": vol}, timeout=3600, memory=32768)
+def compose_fallback(native_tags: str = "r1,r1b", brute_tags: str = "bt4", out: str = "fb1", max_prefix_chars: int = 90000):
+    """Fallback demonstrations spliced from the model's own outputs, for the cases where it scores zero:
+      F1  the first turn's thinking was cut off and the harness asked for a tool call -> brute force, EXIT
+      F2  two submissions have failed                                              -> brute force, EXIT
+    The earlier turns are context only; the brute-force turn (the model's own, verified) is learned."""
+    import random
+    import re
+
+    from harness import VARIANTS
+    from sft import scrub
+
+    brute = {}
+    for tag in brute_tags.split(","):
+        for y in _load(f"/data/traj/{tag}.jsonl"):
+            a = [m for m in y["messages"] if m["role"] == "assistant"]
+            v = y["verdicts"]
+            if (y["clean"] and len(a) == 1 and len(a[0].get("tool_calls") or []) == 1 and y["sample_ok"]
+                    and "submit" in a[0]["tool_calls"][0]["function"]["name"]
+                    and v and v.count("AC") > 0 and not {"WA", "RE", "CE"} & set(v)
+                    and len(a[0].get("reasoning_content") or "") <= 12000):
+                if y["id"] not in brute or y["completion_tokens"] < brute[y["id"]]["completion_tokens"]:
+                    brute[y["id"]] = y
+
+    def brute_turn(pid: str, variant: int, n_sub: int) -> list:
+        y = brute[pid]
+        ms = y["messages"]
+        i = next(j for j, m in enumerate(ms) if m["role"] == "assistant")
+        code = json.loads(ms[i]["tool_calls"][0]["function"]["arguments"])[VARIANTS[y["variant"]]["code"]]
+        dst = VARIANTS[variant]
+        call = {"id": "call_fb", "type": "function",
+                "function": {"name": dst["submit"], "arguments": json.dumps({dst["code"]: code})}}
+        return [
+            {"role": "assistant", "content": "", "reasoning_content": scrub(ms[i].get("reasoning_content") or ""),
+             "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "call_fb",
+             "content": re.sub(r"^Submission \d+", f"Submission {n_sub}", ms[i + 1]["content"])},
+            {"role": "assistant", "content": "EXIT"},
+        ]
+
+    def failed(m: dict) -> bool:
+        return m["role"] == "tool" and ("FAILED" in m["content"] or m["content"].startswith("Compilation failed"))
+
+    f1, f2 = defaultdict(list), defaultdict(list)
+    for tag in native_tags.split(","):
+        for t in _load(f"/data/traj/{tag}.jsonl"):
+            if t["id"] not in brute:
+                continue
+            msgs = t["messages"]
+            first_user = next(i for i, m in enumerate(msgs) if m["role"] == "user")
+            body = msgs[first_user + 1:]
+            if not body:
+                continue
+            # Walk the run until one of the two triggers, with a clean history and nothing passing before it.
+            n_fail = n_sub = 0
+            for j, m in enumerate(body):
+                if m["role"] == "assistant" and not m.get("tool_calls"):
+                    # F1: thinking cut off (no tool call), then the harness's request for a tool call
+                    if (len(m.get("reasoning_content") or "") > 40000 and j + 1 < len(body)
+                            and body[j + 1]["role"] == "user"):
+                        prefix = [({**x, "_skip": True} if x["role"] == "assistant" else dict(x)) for x in body[: j + 2]]
+                        # the real grader's wording after a reply without a tool call is unknown: vary it
+                        prefix[-1]["content"] = random.Random(t["id"] + tag).choice(NUDGES).format(**VARIANTS[t["variant"]])
+                        size = sum(len(x.get("content") or "") for x in prefix)
+                        if size <= max_prefix_chars:
+                            f1[t["id"]].append((msgs[: first_user + 1] + prefix, t, n_sub + 1))
+                    break
+                if m["role"] == "user" or (m["role"] == "assistant" and len(m["tool_calls"]) != 1):
+                    break
+                if m["role"] == "tool":
+                    call = body[j - 1]["tool_calls"][0]["function"]["name"]
+                    if "submit" not in call:
+                        continue
+                    n_sub += 1
+                    if not failed(m):
+                        break
+                    n_fail += 1
+                    if n_fail == 2:  # F2: second failed submission
+                        prefix = [({**x, "_skip": True} if x["role"] == "assistant" else dict(x)) for x in body[: j + 1]]
+                        size = sum(len(x.get("reasoning_content") or "") + len(x.get("content") or "") for x in prefix)
+                        if size <= max_prefix_chars:
+                            f2[t["id"]].append((msgs[: first_user + 1] + prefix, t, n_sub + 1))
+                        break
+
+    rows, rng = [], random.Random(0)
+    for kind, pool in (("F1", f1), ("F2", f2)):
+        for pid, opts in pool.items():
+            ctx, t, n_sub = rng.choice(opts)
+            msgs = ctx + brute_turn(pid, t["variant"], n_sub)
+            new = {k: v for k, v in t.items() if k != "messages"}
+            new.update(messages=msgs, kind=kind, keep_think=True, native=True, solved=True, clean=True, exited=True,
+                       turns=sum(m["role"] == "assistant" for m in msgs))
+            rows.append(new)
+    _dump(f"/data/traj/{out}.jsonl", rows)
+    vol.commit()
+    print(f"FALLBACK {out}: verified brute force for {len(brute)} problems; "
+          f"{sum(r['kind'] == 'F1' for r in rows)} cut-off examples, {sum(r['kind'] == 'F2' for r in rows)} failed-twice examples")
+
+
 @app.function(image=image, volumes={"/data": vol}, timeout=1800)
 def compose3(best_tag: str = "best1", brute_tag: str = "bt2,bt3,btfix", out: str = "cmp4", max_brute: int = 50,
              max_chars: int = 22000):
@@ -628,7 +1087,8 @@ def compose2(base_tag: str = "rw1", brute_tag: str = "bt2,bt3", out: str = "cmp2
 @app.function(image=image, secrets=[secret], volumes={"/data": vol}, timeout=6 * 3600, memory=8192)
 def train(tags: str, name: str, lr: float = 1e-4, epochs: float = 2.0, batch_size: int = 8, rank: int = 32,
           max_turns: int = 10, save_every: int = 0, shapes: bool = True, max_t1_chars: int = 0,
-          b_frac: float = 0.4):
+          b_frac: float = 0.4, dedupe: bool = True, max_len: int = 24000, actions_only: bool = False,
+          export: bool = False):
     from collections import Counter
 
     from sft import select, shape
@@ -637,10 +1097,10 @@ def train(tags: str, name: str, lr: float = 1e-4, epochs: float = 2.0, batch_siz
     trajs = []
     for t in tags.split(","):
         trajs += _load(f"/data/traj/{t}.jsonl")
-    sel = select(trajs, max_turns, shapes, max_t1_chars)
+    sel = select(trajs, max_turns, shapes, max_t1_chars, dedupe)
     print(f"{len(trajs)} trajectories loaded, {len(sel)} selected; shapes {Counter(shape(t) for t in sel).most_common(12)}")
     paths = run(sel, name, lr=lr, epochs=epochs, batch_size=batch_size, rank=rank, save_every=save_every,
-                b_frac=b_frac)
+                b_frac=b_frac, max_len=max_len, actions_only=actions_only, export=export)
     _dump(f"/data/ckpt/{name}.jsonl", [{"name": name, "paths": paths, "tags": tags, "n": len(sel)}])
     vol.commit()
     print("PATHS", paths)
