@@ -29,11 +29,17 @@ including the attempts that made the model worse.
 | `marine` | `saphir` plus a learned "now the efficient solution" opener | regressed, stopped early |
 | `outremer` | Pure self-distillation: the 9B's own verified solutions, then EXIT | sanity check only |
 
-On the hackathon leaderboard, the untrained reference `ciel` scored **32.57**. No other leaderboard
-score is recorded here yet.
+On the hackathon leaderboard:
 
-The honest headline: **no trained checkpoint has beaten the untrained base on our local validation
-set so far.** What the later versions do gain is discipline. `saphir` finishes in 5.8 turns on average
+| Version | Leaderboard score | Duration per test |
+|---|---|---|
+| `ciel` (untrained reference) | **32.57** | 12m51s |
+| `outremer` | 28.17 | 2m50s |
+
+The honest headline: **no trained checkpoint has beaten the untrained base, either on our local
+validation set or on the leaderboard.** `outremer` is more than four times faster per test but
+scores 4.4 points lower, and speed only matters as a tie-break. What the later versions do gain is
+discipline. `saphir` finishes in 5.8 turns on average
 against 9.9 for the base, and on the 48 problems where both were compared it left 3 without any
 submission against 14 for the base. `outremer` solved the first 10 easy-to-medium validation
 problems in 2 turns on average. It was not scored on the hard problems locally because the Tinker
@@ -113,6 +119,9 @@ EXIT: 104 trajectories, about $1.50 in total.
 - Token boundaries after `<think>\n` differ between a rendered conversation and a generated
   continuation when the reasoning is empty. `sft.py` handles this explicitly; before the fix some
   trajectories silently produced no training sequence.
+- Making the model decisive cost it points. `outremer` thinks briefly, submits once and stops; the
+  base thinks far longer and keeps testing and resubmitting. On the leaderboard the slow, untidy
+  behaviour won by 4.4 points, so the base's long reasoning is worth more than a clean finish.
 - Brute-force-first is worth having in principle: on the validation set the base scores zero on 31 of
   52 problems, and on 16 of those it never submits anything.
 
