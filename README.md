@@ -21,14 +21,16 @@ including the many attempts that made the model worse before one made it better.
 
 | Version | Leaderboard score | Duration per test |
 |---|---|---|
-| `lagon` (expert iteration on the model's own runs, plus fallback examples) | **41.20** | 5m10s |
+| `cyan2` (expert iteration on the model's own runs) | **45.81** | 9m08s |
+| `lagon` (same, plus brute-force fallback examples) | 41.20 | 5m10s |
 | `ciel` (untrained reference) | 32.57 | 12m51s |
 | `outremer` (earlier self-distillation attempt) | 28.17 | 2m50s |
 
-`lagon` put the team second of 17 at the time it was graded. It is sampled at **temperature 1.0**,
-not the 0.6 that suits the base model; that setting turned out to matter as much as the training.
+`cyan2` put the team second of 17, 0.52 points behind first place (46.33) when it was graded. It is
+sampled at **temperature 1.0**, not the 0.6 that suits the base model; that setting turned out to
+matter as much as the training.
 
-Other leaderboard results are not recorded here.
+Each score above is a single grading. Other leaderboard results are not recorded here.
 
 ## What worked
 
@@ -40,20 +42,22 @@ Other leaderboard results are not recorded here.
    60 more if it passes the large ones.
 3. Keep the best run per problem, cut it at the first submission of the winning program, append `EXIT`.
 4. Train on those runs, reasoning included (1,165 runs, 216 of them on problems rated 1600–2800).
-5. Add **fallback examples** built from the model's own verified brute-force solutions: when its
-   thinking was cut off without a tool call, or two submissions have failed, submit a brute force and stop
-   (306 examples). These target the problems where the base model scores zero.
-6. Sample at temperature 1.0.
+5. Sample at temperature 1.0.
 
-Two findings made this work after a first round that looked like a failure:
+That is `cyan2`. Two findings made it work after a first round that looked like a failure:
 
 - **Self-training sharpens the model, and it starts to loop.** Trained on its own successful runs and
   sampled at 0.6, the model ran its thinking to the output limit far more often than the base and
   scored 22 locally. The same checkpoint at temperature 1.0 was back at the base's level. Across the
   sweep on `lagon`, 1.0 beat both 0.9 and 1.2.
-- **The local score undervalued the fallback.** Locally `lagon` was only 0.6 points above the base on
-  the strict score, but 3 points above with partial credit; on the leaderboard it was 8.6 points above.
-  The hidden small tests evidently reward a correct brute force more than our stand-in did.
+- **The local score ranked the models correctly but badly underestimated the gain.** Locally `cyan2`
+  was 2 points above the base on the strict score and 5 with partial credit; on the leaderboard it
+  was 13 points above. We do not know why the gap is so much larger on the hidden problems.
+
+**The fallback examples did not help.** `lagon` adds 306 examples built from the model's own verified
+brute-force solutions (when its thinking was cut off without a tool call, or two submissions have
+failed, submit a brute force and stop). It scored 41.20, below `cyan2` without them. With one grading
+each, part of that difference may be noise, but there is no evidence the fallback is worth having.
 
 ## Local scoring
 
@@ -129,7 +133,7 @@ The scaled models sat between the base and the full adapter and were not better 
   the sharpening.
 - If a turn's reasoning is excluded from the loss, nothing tells the model to start that turn.
 - Tidy behaviour is not the goal. The base model's messy long runs beat a decisive model by 4 points;
-  what helped was keeping that behaviour and adding a fallback for the cases where it produces nothing.
+  what helped was keeping that behaviour and reinforcing the runs that succeed.
 - A local metric can rank correctly and still misjudge the size of a gain by a wide margin.
 - Sampling cost was badly underestimated twice. Multi-turn runs resend a long prompt at every turn,
   and prompt tokens, not generated tokens, dominated the bill.
@@ -151,7 +155,7 @@ The scaled models sat between the base and the full adapter and were not better 
 
 Trajectories, logs and problem data are not in the repository.
 
-## Reproducing `lagon`
+## Reproducing `cyan2` and `lagon`
 
 Requirements: [uv](https://docs.astral.sh/uv/), a Tinker API key and a Modal account. Data
 preparation, C++ execution and orchestration run on Modal (CPU only); sampling and training run on
@@ -175,21 +179,22 @@ uv run modal run --detach modal_app.py::gen --model Qwen/Qwen3.5-9B --tag r1 --s
 # 2. best run per problem, cut at the winning submission
 uv run modal run modal_app.py::build_ei --tags r1 --out ei1 --max-turns 12
 
-# 3. fallback examples from the model's own brute-force turns
+# 3. (only for lagon) fallback examples from the model's own brute-force turns
 uv run modal run --detach modal_app.py::gen --model Qwen/Qwen3.5-9B --tag bt4 --split train \
     --n 1400 --rmin 1000 --rmax 2800 --first-turn brute --samples 2 --max-tokens 8000
 uv run modal run modal_app.py::compose_fallback --native-tags r1,r1b,r1c --brute-tags bt4 --out fb3
 
 # 4. train, then score locally at temperature 1.0
-uv run modal run --detach modal_app.py::train --tags ei1,ei1b,ei1c,fb3 --name lagon \
+#    cyan2: --tags ei1,ei1b,ei1c --name cyan2      lagon: --tags ei1,ei1b,ei1c,fb3 --name lagon
+uv run modal run --detach modal_app.py::train --tags ei1,ei1b,ei1c --name cyan2 \
     --lr 1.5e-4 --epochs 1.5 --b-frac 0.1 --no-shapes --no-dedupe --max-turns 14 --max-len 32000
 uv run modal run --detach modal_app.py::gen --model <tinker path> --tag dev-lagon --split dev \
     --n 200 --max-turns 16 --temperature 1.0 --samples 2
 ```
 
-Submission settings for `lagon`: thinking on, temperature 1.0, output length 16000 tokens.
+Submission settings: thinking on, temperature 1.0, output length 16000 tokens.
 
-Cost, roughly: the `lagon` training itself is about $31. The sampling behind it is far more: the
+Cost, roughly: the `cyan2` training itself is about $28 and `lagon` about $31. The sampling behind it is far more: the
 first account's credits (about $577 in all) were exhausted by the whole day's experiments, and the
 final trainings ran on a teammate's account.
 
