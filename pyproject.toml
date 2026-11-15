@@ -1,0 +1,12 @@
+[project]
+name = "vals-cpp-posttrain"
+version = "0.1.0"
+description = "Post-training Qwen3.5-9B on Tinker for C++ competitive programming (Vals AI hackathon)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "jinja2>=3.1.6",
+    "modal>=1.6.4",
+    "openai>=3.51.0",
+    "tinker>=0.39.0",
+]
